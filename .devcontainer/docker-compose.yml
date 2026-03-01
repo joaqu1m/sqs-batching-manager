@@ -1,0 +1,11 @@
+name: sqs-batching-manager
+version: '3.8'
+services:
+  devcontainer:
+    container_name: sqs-batching-manager-devcontainer
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../..:/workspaces:cached
+    command: sleep infinity

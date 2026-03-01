@@ -1,0 +1,22 @@
+{
+	"name": "sqs-batching-manager",
+	"dockerComposeFile": "docker-compose.yml",
+	"service": "devcontainer",
+	"workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+	"features": {
+		"ghcr.io/devcontainers/features/go:1": {
+			"version": "latest"
+		}
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-azuretools.vscode-docker",
+				"golang.Go"
+			],
+			"settings": {
+				"go.toolsManagement.autoUpdate": true
+			}
+		}
+	}
+}
