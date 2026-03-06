@@ -2,11 +2,16 @@ package constants
 
 // All of this values are described here: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html
 
-const (
-	AWSSendMessageBatchMaxTotalPayloadSizeKiB uint64 = 1024
-	AWSSendMessageBatchMaxMessagesCount       uint64 = 10
+var (
+	AWSSQSChargingThresholdsBytes = []uint64{
+		64 * 1024,  // 64 KiB
+		128 * 1024, // 128 KiB
+		192 * 1024, // 192 KiB
+		256 * 1024, // 256 KiB
+	}
 )
 
-var (
-	AWSChargingThresholdsKiB = []uint64{64, 128, 192, 256}
+const (
+	AWSSendMessageBatchMaxTotalPayloadSizeBytes uint64 = 1024 * 1024 // 1 MiB
+	AWSSendMessageBatchMaxMessagesCount         uint64 = 10
 )

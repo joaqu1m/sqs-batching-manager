@@ -1,9 +1,8 @@
 package types
 
 type QueueReference struct {
-	Name               string
-	URL                string
-	BatchableConsumers bool
+	Name string
+	URL  string
 }
 
 type AddMessageInput struct {
@@ -13,7 +12,7 @@ type AddMessageInput struct {
 	MessageGroupID    *string
 }
 
-type FlushResult struct {
+type FlushOutput struct {
 	Errors []FlushErroredMessage
 }
 

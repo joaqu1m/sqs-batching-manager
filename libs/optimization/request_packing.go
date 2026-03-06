@@ -2,10 +2,10 @@ package optimization
 
 import (
 	"cmp"
-	"encoding/json"
 	"slices"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/joaqu1m/sqs-batching-manager/libs/entities"
 	"github.com/joaqu1m/sqs-batching-manager/libs/internal_errors"
 )
 
@@ -22,14 +22,8 @@ func sizeOfEntry(msg types.SendMessageBatchRequestEntry) (uint64, error) {
 		bodySize = uint64(len(*msg.MessageBody))
 	}
 
-	attrsSize := uint64(0)
-	if len(msg.MessageAttributes) > 0 {
-		attrsBytes, err := json.Marshal(msg.MessageAttributes)
-		if err != nil {
-			return 0, err
-		}
-		attrsSize = uint64(len(attrsBytes))
-	}
+	attrs := entities.MessageAttributes(msg.MessageAttributes)
+	attrsSize := uint64(attrs.GetAWSSizeInBytes())
 
 	return bodySize + attrsSize, nil
 }
@@ -41,11 +35,9 @@ type sqsItem struct {
 
 func PackMessagesIntoRequests(
 	messages []types.SendMessageBatchRequestEntry,
-	awsSendMessageBatchMaxTotalPayloadSizeKiB uint64,
+	AWSSendMessageBatchMaxTotalPayloadSizeBytes uint64,
 	awsSendMessageBatchMaxMessagesCount uint64,
 ) ([][]types.SendMessageBatchRequestEntry, []SendMessageBatchRequestEntryError) {
-
-	maxBytes := awsSendMessageBatchMaxTotalPayloadSizeKiB * 1024
 
 	erroredItems := []SendMessageBatchRequestEntryError{}
 
@@ -60,7 +52,7 @@ func PackMessagesIntoRequests(
 			})
 			continue
 		}
-		if size > maxBytes {
+		if size > AWSSendMessageBatchMaxTotalPayloadSizeBytes {
 			erroredItems = append(erroredItems, SendMessageBatchRequestEntryError{
 				Message: msg,
 				Err:     internal_errors.NewExceededAllowedSizeError(int64(size)),
@@ -89,7 +81,7 @@ func PackMessagesIntoRequests(
 
 		var leftovers []sqsItem
 		for _, candidate := range remaining {
-			fits := currentSize+candidate.size <= maxBytes &&
+			fits := currentSize+candidate.size <= AWSSendMessageBatchMaxTotalPayloadSizeBytes &&
 				uint64(len(currentBatch)) < awsSendMessageBatchMaxMessagesCount
 			if fits {
 				currentBatch = append(currentBatch, candidate.entry)

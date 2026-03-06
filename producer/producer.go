@@ -2,41 +2,46 @@ package producer
 
 import (
 	"context"
-	"reflect"
 	"strconv"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/joaqu1m/sqs-batching-manager/libs/constants"
+	"github.com/joaqu1m/sqs-batching-manager/libs/entities"
 	"github.com/joaqu1m/sqs-batching-manager/libs/internal_errors"
 	"github.com/joaqu1m/sqs-batching-manager/libs/optimization"
 	qbm_types "github.com/joaqu1m/sqs-batching-manager/libs/types"
 )
 
-// Here we'll group items by 3 factors, to help the Flush method to decide how to batch them:
+// Here we'll group items by 2 factors, to help the Flush method to decide how to batch them:
 
 // 1. By queue, since we can't batch items from different queues together anyways
-// 2. By the "batchable" factor, since if some consumer can't batch, we need to send its items one by one; That's determined by 2 properties:
-//   - The presence of "BatchableConsumers" in the Queue struct, which represents the Consumer capacity to batch or not.
-//   - The presence of "MessageAttributes" in the QueueItem struct, which means this item needs to have his own-and-solo MessageAttributes field
-// 3. By the "MessageGroupID" field, since messages with different MessageGroupIDs can't be in the same batch.
+// 2. By a composite key of (MessageGroupID, marshaledMessageAttributes), since messages with different
+//    group IDs or different message attributes can't share a batch entry.
 
-type Queue struct {
-	QueueReference                 qbm_types.QueueReference
-	SoloQueueMessages              []SoloQueueMessage
-	BatchableQueueMessagesByGroups map[string][]map[string]any
+// groupKey uniquely identifies a batch group within a queue.
+type groupKey struct {
+	MessageGroupID *string // empty string means no group
+	MarshaledAttrs string  // JSON-marshaled message attributes; empty means no attributes
 }
 
-type SoloQueueMessage struct {
-	MessageBody       map[string]any
-	MessageAttributes map[string]any
+type groupValue struct {
 	MessageGroupID    *string
+	MessageAttributes map[string]any
+	Messages          []map[string]any
+}
+
+type Queue struct {
+	QueueReference qbm_types.QueueReference
+	Groups         map[groupKey]groupValue
 }
 
 type QBMProducer struct {
 	ctx             context.Context
 	sqsClient       *sqs.Client
+	mu              sync.Mutex
 	queues          map[string]Queue
 	referenceQueues map[string]qbm_types.QueueReference
 }
@@ -56,95 +61,110 @@ func (qbm *QBMProducer) Add(addMessageInput qbm_types.AddMessageInput) {
 		return
 	}
 
-	qbm.EnsureQueueExists(addMessageInput.QueueName)
+	qbm.mu.Lock()
+	defer qbm.mu.Unlock()
+
+	qbm.ensureQueueExists(addMessageInput.QueueName)
 
 	queue := qbm.queues[addMessageInput.QueueName]
 
-	// if addMessageInput
+	// Build the composite group key
+	marshaledAttrs := ""
+	if len(addMessageInput.MessageAttributes) > 0 {
+		if attrsBytes, err := entities.NewMessageAttributesFromMap(addMessageInput.MessageAttributes).Marshal(); err == nil {
+			marshaledAttrs = string(attrsBytes)
+		}
+	}
+
+	key := groupKey{
+		MessageGroupID: addMessageInput.MessageGroupID,
+		MarshaledAttrs: marshaledAttrs,
+	}
+
+	//
+	group := queue.Groups[key]
+	group.MessageGroupID = addMessageInput.MessageGroupID
+	if group.MessageAttributes == nil && len(addMessageInput.MessageAttributes) > 0 {
+		group.MessageAttributes = addMessageInput.MessageAttributes
+	}
+	group.Messages = append(group.Messages, addMessageInput.MessageBody)
+	queue.Groups[key] = group
 
 	qbm.queues[addMessageInput.QueueName] = queue
 }
 
-func (qbm *QBMProducer) Flush() qbm_types.FlushResult {
+func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
 	erroredItems := []qbm_types.FlushErroredMessage{}
 
-	for _, queue := range qbm.queues {
+	qbm.mu.Lock()
+	queues := qbm.queues
+	qbm.queues = map[string]Queue{}
+	qbm.mu.Unlock()
+
+	for _, queue := range queues {
 
 		sendMessageBatchRequestEntries := []types.SendMessageBatchRequestEntry{}
 
-		for messageGroupID, messages := range queue.BatchableQueueMessagesByGroups {
+		for _, group := range queue.Groups {
 
-			itemsBytes, newErroredItems := optimization.PackIntoSQSBatches(messages, constants.AWSChargingThresholdsKiB)
-			newFlushErroredItems := make([]qbm_types.FlushErroredMessage, len(newErroredItems))
-			for i, newErroredItem := range newErroredItems {
-				newFlushErroredItems[i] = qbm_types.FlushErroredMessage{
-					QueueName:         queue.QueueReference.Name,
-					MessageBody:       newErroredItem.Content,
-					MessageAttributes: nil,
-					MessageGroupID:    aws.String(messageGroupID),
-					Err:               newErroredItem.Err,
-				}
-			}
-			erroredItems = append(erroredItems, newFlushErroredItems...)
+			messageAttributes := entities.NewMessageAttributesFromMap(group.MessageAttributes)
+			messageAttributesSizeBytes := messageAttributes.GetAWSSizeInBytes()
 
-			if len(itemsBytes) == 0 {
-				continue
+			// We need to subtract the size of the message attributes from the total allowed batch size, since all messages in the batch will share the same attributes.
+			// That's why we call this variable "Message Body Size Thresholds", because it's the maximum allowed size for the message body, after accounting for the attributes size.
+			messageBodySizeThresholds := constants.AWSSQSChargingThresholdsBytes
+			for i, threshold := range messageBodySizeThresholds {
+				messageBodySizeThresholds[i] = threshold - uint64(messageAttributesSizeBytes)
 			}
 
-			for i, itemBytes := range itemsBytes {
-				sendMessageBatchRequestEntries[i] = types.SendMessageBatchRequestEntry{
-					Id:             aws.String(strconv.Itoa(i)),
-					MessageBody:    aws.String(string(itemBytes)),
-					MessageGroupId: aws.String(messageGroupID),
-				}
-			}
-
-		}
-
-		for _, soloMessage := range queue.SoloQueueMessages {
-
-			var messageBody any = soloMessage.MessageBody
-			if queue.QueueReference.BatchableConsumers {
-				messageBody = []map[string]any{soloMessage.MessageBody}
-			}
-
-			itemBytes, err := optimization.Marshal(messageBody)
-			if err != nil {
+			itemsBytes, newErroredItems := optimization.PackIntoSQSBatches(group.Messages, messageBodySizeThresholds)
+			for _, newErroredItem := range newErroredItems {
 				erroredItems = append(erroredItems, qbm_types.FlushErroredMessage{
 					QueueName:         queue.QueueReference.Name,
-					MessageBody:       soloMessage.MessageBody,
-					MessageAttributes: soloMessage.MessageAttributes,
-					MessageGroupID:    soloMessage.MessageGroupID,
-					Err:               internal_errors.WrapSerializationError(err),
+					MessageBody:       newErroredItem.Content,
+					MessageAttributes: group.MessageAttributes,
+					MessageGroupID:    group.MessageGroupID,
+					Err:               newErroredItem.Err,
 				})
-				continue
 			}
 
-			sendMessageBatchrequestEntry := types.SendMessageBatchRequestEntry{
-				Id:          aws.String(strconv.Itoa(len(sendMessageBatchRequestEntries))),
-				MessageBody: aws.String(string(itemBytes)),
+			for _, itemBytes := range itemsBytes {
+				entry := types.SendMessageBatchRequestEntry{
+					Id:          aws.String(strconv.Itoa(len(sendMessageBatchRequestEntries))),
+					MessageBody: aws.String(string(itemBytes)),
+				}
+				if !messageAttributes.IsEmpty() {
+					entry.MessageAttributes = messageAttributes
+				}
+				if group.MessageGroupID != nil {
+					entry.MessageGroupId = aws.String(*group.MessageGroupID)
+				}
+				sendMessageBatchRequestEntries = append(sendMessageBatchRequestEntries, entry)
 			}
-
-			messageAttributes := toMessageAttributes(soloMessage.MessageAttributes)
-			if len(messageAttributes) > 0 {
-				sendMessageBatchrequestEntry.MessageAttributes = messageAttributes
-			}
-
-			if soloMessage.MessageGroupID != nil {
-				sendMessageBatchrequestEntry.MessageGroupId = soloMessage.MessageGroupID
-			}
-
-			sendMessageBatchRequestEntries = append(sendMessageBatchRequestEntries, sendMessageBatchrequestEntry)
 
 		}
 
 		entryPackes, packingErrors := optimization.PackMessagesIntoRequests(
 			sendMessageBatchRequestEntries,
-			constants.AWSSendMessageBatchMaxTotalPayloadSizeKiB,
+			constants.AWSSendMessageBatchMaxTotalPayloadSizeBytes,
 			constants.AWSSendMessageBatchMaxMessagesCount,
 		)
-		if packingErrors != nil {
-			// emit an error
+		for _, packingError := range packingErrors {
+			messageBody := map[string]any{}
+			if packingError.Message.MessageBody != nil {
+				_ = optimization.Unmarshal([]byte(*packingError.Message.MessageBody), &messageBody)
+			}
+			messageAttributes := map[string]any{}
+			if len(packingError.Message.MessageAttributes) > 0 {
+				messageAttributes = entities.MessageAttributes(packingError.Message.MessageAttributes).ToMap()
+			}
+			erroredItems = append(erroredItems, qbm_types.FlushErroredMessage{
+				QueueName:         queue.QueueReference.Name,
+				MessageBody:       messageBody,
+				MessageAttributes: messageAttributes,
+				MessageGroupID:    packingError.Message.MessageGroupId,
+				Err:               packingError.Err,
+			})
 		}
 
 		for _, entries := range entryPackes {
@@ -198,13 +218,25 @@ func (qbm *QBMProducer) Flush() qbm_types.FlushResult {
 					})
 					continue
 				}
+				failedItem := sendMessageBatchRequestEntries[parsedInternalID]
 				code := "unknown"
 				if failed.Code != nil {
 					code = *failed.Code
 				}
+				messageBody := map[string]any{}
+				if failedItem.MessageBody != nil {
+					_ = optimization.Unmarshal([]byte(*failedItem.MessageBody), &messageBody)
+				}
+				messageAttributes := map[string]any{}
+				if len(failedItem.MessageAttributes) > 0 {
+					messageAttributes = entities.MessageAttributes(failedItem.MessageAttributes).ToMap()
+				}
 				erroredItems = append(erroredItems, qbm_types.FlushErroredMessage{
-					Err: internal_errors.NewSQSDeliveryError(parsedInternalID > 0, code, failed.SenderFault, failed.Message),
-					// let's fix this error payload soon
+					QueueName:         queue.QueueReference.Name,
+					MessageBody:       messageBody,
+					MessageAttributes: messageAttributes,
+					MessageGroupID:    failedItem.MessageGroupId,
+					Err:               internal_errors.NewSQSDeliveryError(parsedInternalID > 0, code, failed.SenderFault, failed.Message),
 				})
 			}
 
@@ -212,14 +244,12 @@ func (qbm *QBMProducer) Flush() qbm_types.FlushResult {
 
 	}
 
-	qbm.queues = map[string]Queue{}
-
-	return qbm_types.FlushResult{
+	return qbm_types.FlushOutput{
 		Errors: erroredItems,
 	}
 }
 
-func (qbm *QBMProducer) EnsureQueueExists(queueName string) {
+func (qbm *QBMProducer) ensureQueueExists(queueName string) {
 
 	_, alreadyExists := qbm.queues[queueName]
 	if alreadyExists {
@@ -229,17 +259,15 @@ func (qbm *QBMProducer) EnsureQueueExists(queueName string) {
 	queueReference, exists := qbm.referenceQueues[queueName]
 	if !exists {
 		qbm.referenceQueues[queueName] = qbm_types.QueueReference{
-			Name:               queueName,
-			URL:                qbm.FetchQueueURL(queueName),
-			BatchableConsumers: false, // as it is not even in the queues map, we can assume it doesn't have batchable consumers
+			Name: queueName,
+			URL:  qbm.FetchQueueURL(queueName),
 		}
 		return
 	}
 
 	qbm.queues[queueName] = Queue{
-		QueueReference:                 queueReference,
-		SoloQueueMessages:              []SoloQueueMessage{},
-		BatchableQueueMessagesByGroups: map[string][]map[string]any{},
+		QueueReference: queueReference,
+		Groups:         map[groupKey]groupValue{},
 	}
 
 }
@@ -258,44 +286,4 @@ func (qbm *QBMProducer) FetchQueueURL(queueName string) string {
 	// If we can't fetch the URL, just parse the QueueName. For some reason, SQS allows queue names to be used as URLs in the SendMessageBatch API, so we can fallback to that.
 	return queueName
 
-}
-
-func toMessageAttributes(messageAttributes map[string]any) map[string]types.MessageAttributeValue {
-
-	result := make(map[string]types.MessageAttributeValue, len(messageAttributes))
-	for key, value := range messageAttributes {
-
-		reflectedValue := reflect.ValueOf(value)
-
-		switch reflectedValue.Kind() {
-		case reflect.String:
-			result[key] = types.MessageAttributeValue{
-				DataType:    aws.String("String"),
-				StringValue: aws.String(reflectedValue.String()),
-			}
-		case reflect.Bool:
-			result[key] = types.MessageAttributeValue{
-				DataType:    aws.String("String"),
-				StringValue: aws.String(strconv.FormatBool(reflectedValue.Bool())),
-			}
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			result[key] = types.MessageAttributeValue{
-				DataType:    aws.String("Number"),
-				StringValue: aws.String(strconv.FormatInt(reflectedValue.Int(), 10)),
-			}
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			result[key] = types.MessageAttributeValue{
-				DataType:    aws.String("Number"),
-				StringValue: aws.String(strconv.FormatUint(reflectedValue.Uint(), 10)),
-			}
-		case reflect.Float32, reflect.Float64:
-			result[key] = types.MessageAttributeValue{
-				DataType:    aws.String("Number"),
-				StringValue: aws.String(strconv.FormatFloat(reflectedValue.Float(), 'f', -1, 64)),
-			}
-		}
-
-	}
-
-	return result
 }

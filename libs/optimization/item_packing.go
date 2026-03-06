@@ -22,16 +22,16 @@ type ErroredJSONItem struct {
 
 func PackIntoSQSBatches(
 	itemsToBePacked []map[string]any,
-	targetSizeThresholds []uint64,
+	targetSizeThresholdsBytes []uint64,
 ) (packedItems [][]byte, erroredItems []ErroredJSONItem) {
 
 	erroredItems = []ErroredJSONItem{}
 
 	// Ensure thresholds are sorted ascending
-	slices.Sort(targetSizeThresholds)
+	slices.Sort(targetSizeThresholdsBytes)
 
 	// The last threshold acts as the absolute maximum
-	maxThreshold := targetSizeThresholds[len(targetSizeThresholds)-1]
+	maxThreshold := targetSizeThresholdsBytes[len(targetSizeThresholdsBytes)-1]
 
 	// Initially calculate each marshalled item size to do both things at once:
 	byteItemsToBePacked := []JSONItem{}
@@ -82,7 +82,7 @@ func PackIntoSQSBatches(
 
 		// Find the smallest threshold that can accommodate the current batch
 		batchCeiling := maxThreshold
-		for _, threshold := range targetSizeThresholds {
+		for _, threshold := range targetSizeThresholdsBytes {
 			if uint64(len(currentBatchBytes)) <= threshold {
 				batchCeiling = threshold
 				break
