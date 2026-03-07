@@ -42,16 +42,23 @@ type QBMProducer struct {
 	ctx             context.Context
 	sqsClient       *sqs.Client
 	mu              sync.Mutex
-	queues          map[string]Queue
 	referenceQueues map[string]qbm_types.QueueReference
+	queues          map[string]Queue
+	// This is not an exact size of the total messages in memory, but it's a good approximation that allows us to decide when to auto flush.
+	// It isn't also the exact size of messages according to AWS SQS, since we are really counting it for internal memory management.
+	queuesTotalSize uint64
+	// Here we save all the messages that failed in auto flushes, so they can be returned in the next manual flush.
+	failedDelayedMessages []qbm_types.FlushErroredMessage
 }
 
 func NewQueueBatchingManagerProducer(ctx context.Context, sqsClient *sqs.Client, referenceQueues map[string]qbm_types.QueueReference) *QBMProducer {
 	return &QBMProducer{
-		ctx:             ctx,
-		sqsClient:       sqsClient,
-		queues:          map[string]Queue{},
-		referenceQueues: referenceQueues,
+		ctx:                   ctx,
+		sqsClient:             sqsClient,
+		referenceQueues:       referenceQueues,
+		queues:                map[string]Queue{},
+		queuesTotalSize:       0,
+		failedDelayedMessages: []qbm_types.FlushErroredMessage{},
 	}
 }
 
@@ -64,7 +71,16 @@ func (qbm *QBMProducer) Add(addMessageInput qbm_types.AddMessageInput) {
 	qbm.mu.Lock()
 	defer qbm.mu.Unlock()
 
-	qbm.ensureQueueExists(addMessageInput.QueueName)
+	if err := qbm.ensureQueueExistance(addMessageInput.QueueName); err != nil {
+		qbm.failedDelayedMessages = append(qbm.failedDelayedMessages, qbm_types.FlushErroredMessage{
+			QueueName:         addMessageInput.QueueName,
+			MessageBody:       addMessageInput.MessageBody,
+			MessageAttributes: addMessageInput.MessageAttributes,
+			MessageGroupID:    addMessageInput.MessageGroupID,
+			Err:               err,
+		})
+		return
+	}
 
 	queue := qbm.queues[addMessageInput.QueueName]
 
@@ -81,16 +97,35 @@ func (qbm *QBMProducer) Add(addMessageInput qbm_types.AddMessageInput) {
 		MarshaledAttrs: marshaledAttrs,
 	}
 
-	//
-	group := queue.Groups[key]
-	group.MessageGroupID = addMessageInput.MessageGroupID
-	if group.MessageAttributes == nil && len(addMessageInput.MessageAttributes) > 0 {
-		group.MessageAttributes = addMessageInput.MessageAttributes
+	group, ok := queue.Groups[key]
+	if !ok {
+		group = groupValue{
+			MessageGroupID: addMessageInput.MessageGroupID,
+			Messages:       []map[string]any{},
+		}
+		if len(addMessageInput.MessageAttributes) > 0 {
+			group.MessageAttributes = addMessageInput.MessageAttributes
+		}
 	}
 	group.Messages = append(group.Messages, addMessageInput.MessageBody)
 	queue.Groups[key] = group
 
 	qbm.queues[addMessageInput.QueueName] = queue
+	qbm.queuesTotalSize += uint64(len(addMessageInput.MessageBody)) + uint64(len(marshaledAttrs))
+
+	qbm.autoFlushIfNeeded()
+}
+
+const MAX_SIZE_BEFORE_FLUSHING = 1024 * 1024 * 50 // 50 MiB
+
+func (qbm *QBMProducer) autoFlushIfNeeded() {
+
+	if qbm.queuesTotalSize >= MAX_SIZE_BEFORE_FLUSHING {
+		flushOutput := qbm.Flush()
+		qbm.queuesTotalSize = 0
+		qbm.failedDelayedMessages = append(qbm.failedDelayedMessages, flushOutput.Errors...)
+	}
+
 }
 
 func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
@@ -99,6 +134,8 @@ func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
 	qbm.mu.Lock()
 	queues := qbm.queues
 	qbm.queues = map[string]Queue{}
+	erroredItems = append(erroredItems, qbm.failedDelayedMessages...)
+	qbm.failedDelayedMessages = []qbm_types.FlushErroredMessage{}
 	qbm.mu.Unlock()
 
 	for _, queue := range queues {
@@ -108,13 +145,13 @@ func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
 		for _, group := range queue.Groups {
 
 			messageAttributes := entities.NewMessageAttributesFromMap(group.MessageAttributes)
-			messageAttributesSizeBytes := messageAttributes.GetAWSSizeInBytes()
+			messageAttributesSize := messageAttributes.GetAWSSizeInBytes()
 
 			// We need to subtract the size of the message attributes from the total allowed batch size, since all messages in the batch will share the same attributes.
 			// That's why we call this variable "Message Body Size Thresholds", because it's the maximum allowed size for the message body, after accounting for the attributes size.
-			messageBodySizeThresholds := constants.AWSSQSChargingThresholdsBytes
+			messageBodySizeThresholds := constants.AWSSQSChargingThresholds
 			for i, threshold := range messageBodySizeThresholds {
-				messageBodySizeThresholds[i] = threshold - uint64(messageAttributesSizeBytes)
+				messageBodySizeThresholds[i] = threshold - uint64(messageAttributesSize)
 			}
 
 			itemsBytes, newErroredItems := optimization.PackIntoSQSBatches(group.Messages, messageBodySizeThresholds)
@@ -146,13 +183,13 @@ func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
 
 		entryPackes, packingErrors := optimization.PackMessagesIntoRequests(
 			sendMessageBatchRequestEntries,
-			constants.AWSSendMessageBatchMaxTotalPayloadSizeBytes,
+			constants.AWSSendMessageBatchMaxTotalPayloadSize,
 			constants.AWSSendMessageBatchMaxMessagesCount,
 		)
 		for _, packingError := range packingErrors {
 			messageBody := map[string]any{}
 			if packingError.Message.MessageBody != nil {
-				_ = optimization.Unmarshal([]byte(*packingError.Message.MessageBody), &messageBody)
+				_ = optimization.UnmarshalMessageBody([]byte(*packingError.Message.MessageBody), &messageBody)
 			}
 			messageAttributes := map[string]any{}
 			if len(packingError.Message.MessageAttributes) > 0 {
@@ -176,7 +213,7 @@ func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
 			if err != nil {
 				for _, entry := range entries {
 					var messageBody map[string]any
-					if err = optimization.Unmarshal([]byte(*entry.MessageBody), &messageBody); err != nil {
+					if err = optimization.UnmarshalMessageBody([]byte(*entry.MessageBody), &messageBody); err != nil {
 						messageBody = map[string]any{
 							"original_message_body": *entry.MessageBody,
 						}
@@ -225,7 +262,7 @@ func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
 				}
 				messageBody := map[string]any{}
 				if failedItem.MessageBody != nil {
-					_ = optimization.Unmarshal([]byte(*failedItem.MessageBody), &messageBody)
+					_ = optimization.UnmarshalMessageBody([]byte(*failedItem.MessageBody), &messageBody)
 				}
 				messageAttributes := map[string]any{}
 				if len(failedItem.MessageAttributes) > 0 {
@@ -249,41 +286,22 @@ func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
 	}
 }
 
-func (qbm *QBMProducer) ensureQueueExists(queueName string) {
+func (qbm *QBMProducer) ensureQueueExistance(queueName string) error {
 
 	_, alreadyExists := qbm.queues[queueName]
 	if alreadyExists {
-		return
+		return nil
 	}
 
 	queueReference, exists := qbm.referenceQueues[queueName]
-	if !exists {
-		qbm.referenceQueues[queueName] = qbm_types.QueueReference{
-			Name: queueName,
-			URL:  qbm.FetchQueueURL(queueName),
+	if exists {
+		qbm.queues[queueName] = Queue{
+			QueueReference: queueReference,
+			Groups:         map[groupKey]groupValue{},
 		}
-		return
+		return nil
 	}
 
-	qbm.queues[queueName] = Queue{
-		QueueReference: queueReference,
-		Groups:         map[groupKey]groupValue{},
-	}
-
-}
-
-func (qbm *QBMProducer) FetchQueueURL(queueName string) string {
-
-	getQueueURLOutput, err := qbm.sqsClient.GetQueueUrl(qbm.ctx, &sqs.GetQueueUrlInput{
-		QueueName: aws.String(queueName),
-	})
-	if err == nil {
-		if getQueueURLOutput.QueueUrl != nil {
-			return *getQueueURLOutput.QueueUrl
-		}
-	}
-
-	// If we can't fetch the URL, just parse the QueueName. For some reason, SQS allows queue names to be used as URLs in the SendMessageBatch API, so we can fallback to that.
-	return queueName
+	return internal_errors.NewResourceNotFoundError(&queueName)
 
 }

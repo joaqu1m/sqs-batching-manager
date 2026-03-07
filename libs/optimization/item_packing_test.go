@@ -13,13 +13,13 @@ import (
 
 // sizeAlone returns the marshaled byte size of a single item packed alone.
 func sizeAlone(item map[string]any) uint64 {
-	b, _ := Marshal([]map[string]any{item})
+	b, _ := MarshalMessageBody([]map[string]any{item})
 	return uint64(len(b))
 }
 
 // sizeTogether returns the marshaled byte size of several items packed together.
 func sizeTogether(items ...map[string]any) uint64 {
-	b, _ := Marshal(items)
+	b, _ := MarshalMessageBody(items)
 	return uint64(len(b))
 }
 

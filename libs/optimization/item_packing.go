@@ -22,23 +22,23 @@ type ErroredJSONItem struct {
 
 func PackIntoSQSBatches(
 	itemsToBePacked []map[string]any,
-	targetSizeThresholdsBytes []uint64,
+	targetSizeThresholds []uint64,
 ) (packedItems [][]byte, erroredItems []ErroredJSONItem) {
 
 	erroredItems = []ErroredJSONItem{}
 
 	// Ensure thresholds are sorted ascending
-	slices.Sort(targetSizeThresholdsBytes)
+	slices.Sort(targetSizeThresholds)
 
 	// The last threshold acts as the absolute maximum
-	maxThreshold := targetSizeThresholdsBytes[len(targetSizeThresholdsBytes)-1]
+	maxThreshold := targetSizeThresholds[len(targetSizeThresholds)-1]
 
 	// Initially calculate each marshalled item size to do both things at once:
 	byteItemsToBePacked := []JSONItem{}
 	for _, content := range itemsToBePacked {
 
 		// 1. Marshal the item alone into an array to see if it already exceeds the max threshold by itself.
-		bytes, err := Marshal([]map[string]any{content})
+		bytes, err := MarshalMessageBody([]map[string]any{content})
 		if err != nil {
 			erroredItems = append(erroredItems, ErroredJSONItem{
 				Content: content,
@@ -82,7 +82,7 @@ func PackIntoSQSBatches(
 
 		// Find the smallest threshold that can accommodate the current batch
 		batchCeiling := maxThreshold
-		for _, threshold := range targetSizeThresholdsBytes {
+		for _, threshold := range targetSizeThresholds {
 			if uint64(len(currentBatchBytes)) <= threshold {
 				batchCeiling = threshold
 				break
@@ -94,7 +94,7 @@ func PackIntoSQSBatches(
 		for _, candidate := range remaining {
 
 			candidateCurrentBatch := append(currentBatch, candidate.Content)
-			candidateBatchedBytes, err := Marshal(candidateCurrentBatch)
+			candidateBatchedBytes, err := MarshalMessageBody(candidateCurrentBatch)
 			if err != nil {
 				erroredItems = append(erroredItems, ErroredJSONItem{
 					Content: candidate.Content,
@@ -118,7 +118,7 @@ func PackIntoSQSBatches(
 	return packed, erroredItems
 }
 
-func Marshal(v any) ([]byte, error) {
+func MarshalMessageBody(v any) ([]byte, error) {
 
 	if COMPRESS_QUEUE_VALUES {
 		return MarshalOptimized(v)
@@ -128,7 +128,7 @@ func Marshal(v any) ([]byte, error) {
 
 }
 
-func Unmarshal(data []byte, v any) error {
+func UnmarshalMessageBody(data []byte, v any) error {
 
 	if COMPRESS_QUEUE_VALUES {
 		return UnmarshalOptimized(data, v)

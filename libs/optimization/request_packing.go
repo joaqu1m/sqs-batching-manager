@@ -35,7 +35,7 @@ type sqsItem struct {
 
 func PackMessagesIntoRequests(
 	messages []types.SendMessageBatchRequestEntry,
-	AWSSendMessageBatchMaxTotalPayloadSizeBytes uint64,
+	AWSSendMessageBatchMaxTotalPayloadSize uint64,
 	awsSendMessageBatchMaxMessagesCount uint64,
 ) ([][]types.SendMessageBatchRequestEntry, []SendMessageBatchRequestEntryError) {
 
@@ -52,7 +52,7 @@ func PackMessagesIntoRequests(
 			})
 			continue
 		}
-		if size > AWSSendMessageBatchMaxTotalPayloadSizeBytes {
+		if size > AWSSendMessageBatchMaxTotalPayloadSize {
 			erroredItems = append(erroredItems, SendMessageBatchRequestEntryError{
 				Message: msg,
 				Err:     internal_errors.NewExceededAllowedSizeError(int64(size)),
@@ -81,7 +81,7 @@ func PackMessagesIntoRequests(
 
 		var leftovers []sqsItem
 		for _, candidate := range remaining {
-			fits := currentSize+candidate.size <= AWSSendMessageBatchMaxTotalPayloadSizeBytes &&
+			fits := currentSize+candidate.size <= AWSSendMessageBatchMaxTotalPayloadSize &&
 				uint64(len(currentBatch)) < awsSendMessageBatchMaxMessagesCount
 			if fits {
 				currentBatch = append(currentBatch, candidate.entry)
