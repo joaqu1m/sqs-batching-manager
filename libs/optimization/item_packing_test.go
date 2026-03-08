@@ -27,7 +27,7 @@ func sizeTogether(items ...map[string]any) uint64 {
 func decodeBatch(t *testing.T, batch []byte) []map[string]any {
 	t.Helper()
 	var result []map[string]any
-	if err := UnmarshalOptimized(batch, &result); err != nil {
+	if err := UnmarshalMessageBody(batch, &result); err != nil {
 		t.Fatalf("decodeBatch failed: %v", err)
 	}
 	return result
@@ -116,7 +116,10 @@ func TestSingleThreshold_SplitAcrossMultipleBatches(t *testing.T) {
 		newPaddedItem("a", 80), newPaddedItem("b", 80), newPaddedItem("c", 80),
 		newPaddedItem("d", 80), newPaddedItem("e", 80),
 	}
-	// Threshold = size of one item alone → each item is its own batch.
+	// Threshold = size of one item alone.
+	// With a warm high-compression encoder, similar items may compress better
+	// together than alone, so the exact batch count is not a stable invariant.
+	// We verify the correct invariants: no items lost, no batch exceeds threshold.
 	threshold := sizeAlone(items[0])
 
 	packed, errored := PackIntoSQSBatches(items, []uint64{threshold})
@@ -124,11 +127,13 @@ func TestSingleThreshold_SplitAcrossMultipleBatches(t *testing.T) {
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d", len(errored))
 	}
-	if len(packed) != 5 {
-		t.Fatalf("expected 5 batches (one per item), got %d", len(packed))
-	}
 	if countPackedItems(t, packed) != 5 {
 		t.Errorf("expected 5 total items, got %d", countPackedItems(t, packed))
+	}
+	for i, batch := range packed {
+		if uint64(len(batch)) > threshold {
+			t.Errorf("batch %d size %d exceeds threshold %d", i, len(batch), threshold)
+		}
 	}
 }
 
@@ -565,9 +570,15 @@ func TestThresholdOrder_UnorderedProducesSameResult(t *testing.T) {
 	if len(p1) != len(p2) || len(p2) != len(p3) {
 		t.Fatalf("batch counts differ: %d, %d, %d", len(p1), len(p2), len(p3))
 	}
+	// Compare decoded item counts per batch, not byte sizes.
+	// A warm high-compression encoder may produce slightly different byte sizes
+	// for identical content depending on encoder state, but the grouping must be identical.
 	for i := range p1 {
-		if len(p1[i]) != len(p2[i]) || len(p2[i]) != len(p3[i]) {
-			t.Errorf("batch %d sizes differ: %d, %d, %d", i, len(p1[i]), len(p2[i]), len(p3[i]))
+		n1 := len(decodeBatch(t, p1[i]))
+		n2 := len(decodeBatch(t, p2[i]))
+		n3 := len(decodeBatch(t, p3[i]))
+		if n1 != n2 || n2 != n3 {
+			t.Errorf("batch %d item counts differ: %d, %d, %d", i, n1, n2, n3)
 		}
 	}
 }

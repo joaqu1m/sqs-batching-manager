@@ -49,7 +49,7 @@ func PackIntoSQSBatches(
 		if uint64(len(bytes)) > maxThreshold {
 			erroredItems = append(erroredItems, ErroredJSONItem{
 				Content: content,
-				Err:     internal_errors.NewExceededAllowedSizeError(int64(len(bytes))),
+				Err:     internal_errors.NewExceededAllowedSizeError(uint64(len(bytes))),
 			})
 			continue
 		}

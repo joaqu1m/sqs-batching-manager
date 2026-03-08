@@ -84,7 +84,7 @@ func (ma MessageAttributes) IsEmpty() bool {
 	return len(ma) == 0
 }
 
-func (ma MessageAttributes) GetAWSSizeInBytes() int {
+func (ma MessageAttributes) GetAWSSizeInBytes() uint64 {
 	totalSize := 0
 
 	// AWS Size Calculation:
@@ -106,5 +106,5 @@ func (ma MessageAttributes) GetAWSSizeInBytes() int {
 		}
 	}
 
-	return totalSize
+	return uint64(totalSize)
 }

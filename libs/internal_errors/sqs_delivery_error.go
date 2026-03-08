@@ -10,8 +10,8 @@ type SQSDeliveryError struct {
 	File string
 	Line int
 
-	// Indicates whether the message ID was successfully parsed from the SQS response. This can be useful for debugging and error handling, as it provides insight into whether the failure was due to an issue with parsing the response or if it was a different kind of error.
-	WasIDParsedSuccesfully bool
+	// Indicates whether the message ID was successfully parsed as integer from the SQS response and the item was found at the original array. This can be useful for debugging and error handling, as it provides insight into whether the failure was due to an issue with parsing the response or if it was a different kind of error.
+	WasItemIdentified bool
 
 	// An error code representing why the action failed on this entry.
 	Code string
@@ -24,7 +24,7 @@ type SQSDeliveryError struct {
 }
 
 // SQSDeliveryError represents errors encountered when delivering messages to SQS using "SendMessage" or "SendMessageBatch" API actions.
-func NewSQSDeliveryError(wasIDParsedSuccesfully bool, code string, senderFault bool, message *string) *SQSDeliveryError {
+func NewSQSDeliveryError(wasItemIdentified bool, code string, senderFault bool, message *string) *SQSDeliveryError {
 	_, file, line, ok := runtime.Caller(1)
 	if !ok {
 		file = "unknown"
@@ -32,19 +32,19 @@ func NewSQSDeliveryError(wasIDParsedSuccesfully bool, code string, senderFault b
 	}
 
 	return &SQSDeliveryError{
-		File:                   file,
-		Line:                   line,
-		WasIDParsedSuccesfully: wasIDParsedSuccesfully,
-		Code:                   code,
-		SenderFault:            senderFault,
-		Message:                message,
+		File:              file,
+		Line:              line,
+		WasItemIdentified: wasItemIdentified,
+		Code:              code,
+		SenderFault:       senderFault,
+		Message:           message,
 	}
 }
 
 func (e SQSDeliveryError) Error() string {
 
 	criticalErrorPrefix := ""
-	if !e.WasIDParsedSuccesfully {
+	if !e.WasItemIdentified {
 		criticalErrorPrefix = "Critical "
 	}
 

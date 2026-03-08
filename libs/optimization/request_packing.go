@@ -22,8 +22,7 @@ func sizeOfEntry(msg types.SendMessageBatchRequestEntry) (uint64, error) {
 		bodySize = uint64(len(*msg.MessageBody))
 	}
 
-	attrs := entities.MessageAttributes(msg.MessageAttributes)
-	attrsSize := uint64(attrs.GetAWSSizeInBytes())
+	attrsSize := entities.MessageAttributes(msg.MessageAttributes).GetAWSSizeInBytes()
 
 	return bodySize + attrsSize, nil
 }
@@ -55,7 +54,7 @@ func PackMessagesIntoRequests(
 		if size > AWSSendMessageBatchMaxTotalPayloadSize {
 			erroredItems = append(erroredItems, SendMessageBatchRequestEntryError{
 				Message: msg,
-				Err:     internal_errors.NewExceededAllowedSizeError(int64(size)),
+				Err:     internal_errors.NewExceededAllowedSizeError(size),
 			})
 			continue
 		}

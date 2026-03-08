@@ -9,11 +9,11 @@ import (
 type ExceededAllowedSizeError struct {
 	File     string
 	Line     int
-	ItemSize int64
+	ItemSize uint64
 }
 
 // ExceededAllowedSizeError represents errors when the maximum allowed size is reached
-func NewExceededAllowedSizeError(itemSize int64) ExceededAllowedSizeError {
+func NewExceededAllowedSizeError(itemSize uint64) ExceededAllowedSizeError {
 	_, file, line, ok := runtime.Caller(1)
 	if !ok {
 		file = "unknown"
