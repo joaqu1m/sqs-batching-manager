@@ -3,6 +3,7 @@ package producer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"strconv"
 	"sync"
@@ -25,14 +26,14 @@ import (
 
 // groupKey uniquely identifies a batch group within a queue.
 type groupKey struct {
-	MessageGroupID *string // empty string means no group
-	MarshaledAttrs string  // JSON-marshaled message attributes; empty means no attributes
+	MessageGroupID string // empty string means no group
+	MarshaledAttrs string // JSON-marshaled message attributes; empty string means no attributes
 }
 
 type groupValue struct {
 	MessageGroupID    *string        // nullable
 	MessageAttributes map[string]any // nullable
-	Messages          []map[string]any
+	Messages          []optimization.SQSItem
 }
 
 type Queue struct {
@@ -49,10 +50,60 @@ type QBMProducer struct {
 	// This is not an exact size of the total messages in memory, but it's a good approximation that allows us to decide when to auto flush.
 	// It isn't also the exact size of messages according to AWS SQS, since we are really counting it for internal memory management.
 	queuesTotalSize uint64
-	// Here we save all the messages that failed in auto flushes, so they can be returned in the next manual flush.
+	// failedDelayedMessages holds every failure that happened during an auto-flush, each carrying only the
+	// caller-provided MessageID of the affected message (not the body). They sit here, in the producer, until
+	// the caller invokes Flush() manually — at which point they are appended to the returned
+	// FlushOutput.Errors and cleared. This is what lets Add() stay fire-and-forget on the success path.
+	// Trade-off: this slice grows unbounded between manual flushes. The caller MUST call Flush() before
+	// discarding the producer, otherwise both the buffered messages and the failure records leave with it,
+	// and the caller will not know which MessageIDs failed.
 	failedDelayedMessages []qbm_types.FlushErroredMessage
 }
 
+// entryOrigin records, per SendMessageBatchRequestEntry built during Flush(), the MessageIDs of the logical
+// messages packed into it and the queue it targets. Keyed by entry.Id (the sequential integer we stringify as
+// the AWS batch ID), it is the sidecar error paths consult to surface caller MessageIDs instead of payload
+// contents.
+type entryOrigin struct {
+	MessageIDs []string
+	QueueName  string
+}
+
+// expandEntryErrors fans an entry-level failure out into one FlushErroredMessage per MessageID packed into
+// that entry — all sharing the same Err. When the origin lookup fails (entry.Id missing/unparseable or no
+// recorded origin) we still emit a single stub record with an empty MessageID so the "nothing silently
+// dropped" invariant survives, even though at that point we cannot tell the caller which item(s) were
+// affected.
+func expandEntryErrors(
+	origins map[int]entryOrigin,
+	fallbackQueueName string,
+	entry types.SendMessageBatchRequestEntry,
+	err error,
+) []qbm_types.FlushErroredMessage {
+	if entry.Id != nil {
+		if idx, parseErr := strconv.Atoi(*entry.Id); parseErr == nil {
+			if origin, ok := origins[idx]; ok {
+				out := make([]qbm_types.FlushErroredMessage, 0, len(origin.MessageIDs))
+				for _, messageID := range origin.MessageIDs {
+					out = append(out, qbm_types.FlushErroredMessage{
+						QueueName: origin.QueueName,
+						MessageID: messageID,
+						Err:       err,
+					})
+				}
+				return out
+			}
+		}
+	}
+	return []qbm_types.FlushErroredMessage{{
+		QueueName: fallbackQueueName,
+		Err:       err,
+	}}
+}
+
+// NewQueueBatchingManagerProducer builds a producer bound to the given SQS client and a static map of queues
+// (name → URL) that Add() is allowed to target. Adding a message for a queue name absent from this map yields a
+// resource-not-found error that surfaces on the next Flush().
 func NewQueueBatchingManagerProducer(ctx context.Context, sqsClient *sqs.Client, referenceQueues map[string]qbm_types.QueueReference) *QBMProducer {
 	return &QBMProducer{
 		ctx:                   ctx,
@@ -64,6 +115,15 @@ func NewQueueBatchingManagerProducer(ctx context.Context, sqsClient *sqs.Client,
 	}
 }
 
+// Add buffers a message for later delivery. It is fire-and-forget: validation, packing and AWS errors are NOT
+// returned here — they are recorded inside the producer and surfaced on the next Flush() as FlushErroredMessages
+// carrying the caller-provided ID (not the body).
+//
+// addMessageInput.MessageID must be non-empty; an empty ID is treated as a validation error and recorded for the next
+// Flush(). The producer does not enforce ID uniqueness across calls — callers should choose IDs they can map
+// back to their own bookkeeping.
+//
+// May synchronously trigger an auto-flush when the internal buffer exceeds MAX_SIZE_BEFORE_FLUSHING.
 func (qbm *QBMProducer) Add(addMessageInput qbm_types.AddMessageInput) {
 
 	qbm.autoFlushIfNeeded()
@@ -71,45 +131,50 @@ func (qbm *QBMProducer) Add(addMessageInput qbm_types.AddMessageInput) {
 	qbm.mu.Lock()
 	defer qbm.mu.Unlock()
 
-	// === Testing if the MessageBody is valid
+	// === Checking if the Added Message is valid
+	if addMessageInput.MessageID == "" {
+		qbm.failedDelayedMessages = append(qbm.failedDelayedMessages, qbm_types.FlushErroredMessage{
+			QueueName: addMessageInput.QueueName,
+			MessageID: "",
+			Err:       errors.New("AddMessageInput.MessageID is required"),
+		})
+		return
+	}
 	if len(addMessageInput.MessageBody) == 0 {
+		qbm.failedDelayedMessages = append(qbm.failedDelayedMessages, qbm_types.FlushErroredMessage{
+			QueueName: addMessageInput.QueueName,
+			MessageID: addMessageInput.MessageID,
+			Err:       errors.New("AddMessageInput.MessageBody is required"),
+		})
 		return
 	}
 	messageBodyBytes, err := json.Marshal(addMessageInput.MessageBody)
 	if err != nil {
 		qbm.failedDelayedMessages = append(qbm.failedDelayedMessages, qbm_types.FlushErroredMessage{
-			QueueName:         addMessageInput.QueueName,
-			MessageBody:       addMessageInput.MessageBody,
-			MessageAttributes: addMessageInput.MessageAttributes,
-			MessageGroupID:    addMessageInput.MessageGroupID,
-			Err:               internal_errors.WrapSerializationError(err),
+			QueueName: addMessageInput.QueueName,
+			MessageID: addMessageInput.MessageID,
+			Err:       internal_errors.WrapSerializationError(err),
 		})
 		return
 	}
-
 	// here we only check if MessageAttributes exceeds the maximum allowed, since MessageBody has its own complex rules that are checked later
 	maxThreshold := constants.AWSSQSChargingThresholds[len(constants.AWSSQSChargingThresholds)-1]
 	messageAttributes := entities.NewMessageAttributesFromMap(addMessageInput.MessageAttributes)
 	if messageAttributes.GetAWSSizeInBytes() >= maxThreshold {
 		qbm.failedDelayedMessages = append(qbm.failedDelayedMessages, qbm_types.FlushErroredMessage{
-			QueueName:         addMessageInput.QueueName,
-			MessageBody:       addMessageInput.MessageBody,
-			MessageAttributes: addMessageInput.MessageAttributes,
-			MessageGroupID:    addMessageInput.MessageGroupID,
-			Err:               internal_errors.NewExceededAllowedSizeError(messageAttributes.GetAWSSizeInBytes()),
+			QueueName: addMessageInput.QueueName,
+			MessageID: addMessageInput.MessageID,
+			Err:       internal_errors.NewExceededAllowedSizeError(messageAttributes.GetAWSSizeInBytes()),
 		})
 		return
 	}
-
 	// ===
 
 	if err := qbm.ensureQueueExistance(addMessageInput.QueueName); err != nil {
 		qbm.failedDelayedMessages = append(qbm.failedDelayedMessages, qbm_types.FlushErroredMessage{
-			QueueName:         addMessageInput.QueueName,
-			MessageBody:       addMessageInput.MessageBody,
-			MessageAttributes: addMessageInput.MessageAttributes,
-			MessageGroupID:    addMessageInput.MessageGroupID,
-			Err:               err,
+			QueueName: addMessageInput.QueueName,
+			MessageID: addMessageInput.MessageID,
+			Err:       err,
 		})
 		return
 	}
@@ -123,9 +188,13 @@ func (qbm *QBMProducer) Add(addMessageInput qbm_types.AddMessageInput) {
 			marshaledAttrs = string(attrsBytes)
 		}
 	}
+	messageGroupIDStr := ""
+	if addMessageInput.MessageGroupID != nil {
+		messageGroupIDStr = *addMessageInput.MessageGroupID
+	}
 
 	key := groupKey{
-		MessageGroupID: addMessageInput.MessageGroupID,
+		MessageGroupID: messageGroupIDStr,
 		MarshaledAttrs: marshaledAttrs,
 	}
 
@@ -133,17 +202,21 @@ func (qbm *QBMProducer) Add(addMessageInput qbm_types.AddMessageInput) {
 	if !ok {
 		group = groupValue{
 			MessageGroupID: addMessageInput.MessageGroupID,
-			Messages:       []map[string]any{},
+			Messages:       []optimization.SQSItem{},
 		}
 		if len(addMessageInput.MessageAttributes) > 0 {
 			group.MessageAttributes = addMessageInput.MessageAttributes
 		}
 	}
-	group.Messages = append(group.Messages, addMessageInput.MessageBody)
+	group.Messages = append(group.Messages, optimization.SQSItem{
+		MessageID: addMessageInput.MessageID,
+		Content:   addMessageInput.MessageBody,
+	})
 	queue.Groups[key] = group
 
 	qbm.queues[addMessageInput.QueueName] = queue
-	qbm.queuesTotalSize += uint64(len(messageBodyBytes)) + uint64(len(marshaledAttrs))
+
+	qbm.queuesTotalSize += uint64(len(messageBodyBytes)) + messageAttributes.GetAWSSizeInBytes()
 
 }
 
@@ -168,6 +241,12 @@ func (qbm *QBMProducer) autoFlushIfNeeded() {
 
 }
 
+// Flush drains all buffered messages, dispatches them to SQS, and returns every failure observed at any stage —
+// including failures accumulated by prior auto-flushes. After Flush() returns, the producer's internal state is
+// empty: the caller is then free to drop the references they used to build the messages.
+//
+// Callers MUST invoke Flush() before discarding those references (end of request, end of batch job, shutdown);
+// otherwise both the buffered messages and any pending failure records are lost with the producer.
 func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
 	erroredItems := []qbm_types.FlushErroredMessage{}
 
@@ -182,6 +261,10 @@ func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
 	for _, queue := range queues {
 
 		sendMessageBatchRequestEntries := []types.SendMessageBatchRequestEntry{}
+		// origins is the source-of-truth sidecar for this queue's flush: maps the entry index (the integer we
+		// also stringify into entry.Id) back to the logical messages packed into it. Error paths read from
+		// here instead of unmarshaling the AWS payload, so failures preserve every logical message.
+		origins := map[int]entryOrigin{}
 
 		for _, group := range queue.Groups {
 
@@ -195,21 +278,20 @@ func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
 				messageBodySizeThresholds[i] = threshold - messageAttributesSize
 			}
 
-			itemsBytes, newErroredItems := optimization.PackIntoSQSBatches(group.Messages, messageBodySizeThresholds)
+			packedBatches, newErroredItems := optimization.PackIntoSQSBatches(group.Messages, messageBodySizeThresholds)
 			for _, newErroredItem := range newErroredItems {
 				erroredItems = append(erroredItems, qbm_types.FlushErroredMessage{
-					QueueName:         queue.QueueReference.Name,
-					MessageBody:       newErroredItem.Content,
-					MessageAttributes: group.MessageAttributes,
-					MessageGroupID:    group.MessageGroupID,
-					Err:               newErroredItem.Err,
+					QueueName: queue.QueueReference.Name,
+					MessageID: newErroredItem.MessageID,
+					Err:       newErroredItem.Err,
 				})
 			}
 
-			for _, itemBytes := range itemsBytes {
+			for _, packedBatch := range packedBatches {
+				entryIdx := len(sendMessageBatchRequestEntries)
 				entry := types.SendMessageBatchRequestEntry{
-					Id:          aws.String(strconv.Itoa(len(sendMessageBatchRequestEntries))),
-					MessageBody: aws.String(string(itemBytes)),
+					Id:          aws.String(strconv.Itoa(entryIdx)),
+					MessageBody: aws.String(string(packedBatch.Bytes)),
 				}
 				if !messageAttributes.IsEmpty() {
 					entry.MessageAttributes = messageAttributes
@@ -218,34 +300,24 @@ func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
 					entry.MessageGroupId = aws.String(*group.MessageGroupID)
 				}
 				sendMessageBatchRequestEntries = append(sendMessageBatchRequestEntries, entry)
+				origins[entryIdx] = entryOrigin{
+					MessageIDs: packedBatch.MessageIDs,
+					QueueName:  queue.QueueReference.Name,
+				}
 			}
 
 		}
 
-		entryPackes, packingErrors := optimization.PackMessagesIntoRequests(
+		entryPacks, packingErrors := optimization.PackMessagesIntoRequests(
 			sendMessageBatchRequestEntries,
 			constants.AWSSendMessageBatchMaxTotalPayloadSize,
 			constants.AWSSendMessageBatchMaxMessagesCount,
 		)
 		for _, packingError := range packingErrors {
-			messageBody := map[string]any{}
-			if packingError.Message.MessageBody != nil {
-				_ = optimization.UnmarshalMessageBody([]byte(*packingError.Message.MessageBody), &messageBody)
-			}
-			messageAttributes := map[string]any{}
-			if len(packingError.Message.MessageAttributes) > 0 {
-				messageAttributes = entities.MessageAttributes(packingError.Message.MessageAttributes).ToMap()
-			}
-			erroredItems = append(erroredItems, qbm_types.FlushErroredMessage{
-				QueueName:         queue.QueueReference.Name,
-				MessageBody:       messageBody,
-				MessageAttributes: messageAttributes,
-				MessageGroupID:    packingError.Message.MessageGroupId,
-				Err:               packingError.Err,
-			})
+			erroredItems = append(erroredItems, expandEntryErrors(origins, queue.QueueReference.Name, packingError.Message, packingError.Err)...)
 		}
 
-		erroredItems = append(erroredItems, qbm.sendBatchesConcurrently(entryPackes, sendMessageBatchRequestEntries, queue)...)
+		erroredItems = append(erroredItems, qbm.sendBatchesConcurrently(entryPacks, origins, queue)...)
 
 	}
 
@@ -256,7 +328,7 @@ func (qbm *QBMProducer) Flush() qbm_types.FlushOutput {
 
 func (qbm *QBMProducer) sendBatchesConcurrently(
 	entryPacks [][]types.SendMessageBatchRequestEntry,
-	allEntries []types.SendMessageBatchRequestEntry,
+	origins map[int]entryOrigin,
 	queue Queue,
 ) []qbm_types.FlushErroredMessage {
 	var (
@@ -270,7 +342,7 @@ func (qbm *QBMProducer) sendBatchesConcurrently(
 		go func(entries []types.SendMessageBatchRequestEntry) {
 			defer wg.Done()
 
-			batchErrors := qbm.processSingleBatch(entries, allEntries, queue)
+			batchErrors := qbm.processSingleBatch(entries, origins, queue)
 
 			if len(batchErrors) > 0 {
 				mu.Lock()
@@ -286,7 +358,7 @@ func (qbm *QBMProducer) sendBatchesConcurrently(
 
 func (qbm *QBMProducer) processSingleBatch(
 	entries []types.SendMessageBatchRequestEntry,
-	allEntries []types.SendMessageBatchRequestEntry,
+	origins map[int]entryOrigin,
 	queue Queue,
 ) []qbm_types.FlushErroredMessage {
 	var batchErrors []qbm_types.FlushErroredMessage
@@ -296,71 +368,48 @@ func (qbm *QBMProducer) processSingleBatch(
 		Entries:  entries,
 	})
 	if err != nil {
+		// Whole request failed: every entry — and every logical message packed inside each entry — is errored.
 		for _, entry := range entries {
-			var messageBody map[string]any
-			if err = optimization.UnmarshalMessageBody([]byte(*entry.MessageBody), &messageBody); err != nil {
-				messageBody = map[string]any{
-					"original_message_body": *entry.MessageBody,
-				}
-			}
-			var messageAttributes map[string]any
-			if entry.MessageAttributes != nil {
-				messageAttributes = make(map[string]any, len(entry.MessageAttributes))
-				for key, value := range entry.MessageAttributes {
-					messageAttributes[key] = value
-				}
-			}
-
-			batchErrors = append(batchErrors, qbm_types.FlushErroredMessage{
-				QueueName:         queue.QueueReference.Name,
-				MessageBody:       messageBody,
-				MessageAttributes: messageAttributes,
-				MessageGroupID:    entry.MessageGroupId,
-				Err:               err,
-			})
+			batchErrors = append(batchErrors, expandEntryErrors(origins, queue.QueueReference.Name, entry, err)...)
 		}
 		return batchErrors
 	}
 
 	for _, failed := range sendMessageBatchOutput.Failed {
-		internalID := ""
-		if failed.Id != nil {
-			internalID = *failed.Id
-		} else {
-			batchErrors = append(batchErrors, qbm_types.FlushErroredMessage{
-				QueueName: queue.QueueReference.Name,
-				Err:       internal_errors.NewSQSDeliveryError(false, "unknown", failed.SenderFault, failed.Message),
-			})
-			continue
-		}
-		parsedInternalID, err := strconv.Atoi(internalID)
-		if err != nil {
-			batchErrors = append(batchErrors, qbm_types.FlushErroredMessage{
-				QueueName: queue.QueueReference.Name,
-				Err:       internal_errors.NewSQSDeliveryError(false, "unknown", failed.SenderFault, failed.Message),
-			})
-			continue
-		}
-		failedItem := allEntries[parsedInternalID]
 		code := "unknown"
 		if failed.Code != nil {
 			code = *failed.Code
 		}
-		messageBody := map[string]any{}
-		if failedItem.MessageBody != nil {
-			_ = optimization.UnmarshalMessageBody([]byte(*failedItem.MessageBody), &messageBody)
+
+		// Try to identify the source entry from failed.Id. Anything that prevents a lookup (nil Id, bad parse,
+		// missing origin) collapses to a stub record with WasItemIdentified=false and an empty MessageID.
+		var origin entryOrigin
+		identified := false
+		if failed.Id != nil {
+			if idx, parseErr := strconv.Atoi(*failed.Id); parseErr == nil {
+				if o, ok := origins[idx]; ok {
+					origin = o
+					identified = true
+				}
+			}
 		}
-		messageAttributes := map[string]any{}
-		if len(failedItem.MessageAttributes) > 0 {
-			messageAttributes = entities.MessageAttributes(failedItem.MessageAttributes).ToMap()
+		if !identified {
+			batchErrors = append(batchErrors, qbm_types.FlushErroredMessage{
+				QueueName: queue.QueueReference.Name,
+				Err:       internal_errors.NewSQSDeliveryError(false, code, failed.SenderFault, failed.Message),
+			})
+			continue
 		}
-		batchErrors = append(batchErrors, qbm_types.FlushErroredMessage{
-			QueueName:         queue.QueueReference.Name,
-			MessageBody:       messageBody,
-			MessageAttributes: messageAttributes,
-			MessageGroupID:    failedItem.MessageGroupId,
-			Err:               internal_errors.NewSQSDeliveryError(parsedInternalID > 0, code, failed.SenderFault, failed.Message),
-		})
+
+		// Identified: fan out — one record per logical MessageID packed into the failed entry.
+		deliveryErr := internal_errors.NewSQSDeliveryError(true, code, failed.SenderFault, failed.Message)
+		for _, messageID := range origin.MessageIDs {
+			batchErrors = append(batchErrors, qbm_types.FlushErroredMessage{
+				QueueName: origin.QueueName,
+				MessageID: messageID,
+				Err:       deliveryErr,
+			})
+		}
 	}
 
 	return batchErrors

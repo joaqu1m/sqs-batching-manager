@@ -11,6 +11,20 @@ import (
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// toSQSItems wraps test-built []map[string]any into []SQSItem, reusing the map's "id" key as the SQSItem.MessageID.
+// Tests still build their fixtures as maps; the conversion happens at the PackIntoSQSBatches call boundary.
+func toSQSItems(items []map[string]any) []SQSItem {
+	out := make([]SQSItem, len(items))
+	for i, item := range items {
+		id := ""
+		if raw, ok := item["id"]; ok {
+			id = fmt.Sprintf("%v", raw)
+		}
+		out[i] = SQSItem{MessageID: id, Content: item}
+	}
+	return out
+}
+
 // sizeAlone returns the marshaled byte size of a single item packed alone.
 func sizeAlone(item map[string]any) uint64 {
 	b, _ := MarshalMessageBody([]map[string]any{item})
@@ -34,20 +48,20 @@ func decodeBatch(t *testing.T, batch []byte) []map[string]any {
 }
 
 // countPackedItems counts total items across all decoded batches.
-func countPackedItems(t *testing.T, packed [][]byte) int {
+func countPackedItems(t *testing.T, packed []PackedBatch) int {
 	t.Helper()
 	n := 0
 	for _, b := range packed {
-		n += len(decodeBatch(t, b))
+		n += len(decodeBatch(t, b.Bytes))
 	}
 	return n
 }
 
 // findBatch returns the index of the first batch that contains an item with id == target.
-func findBatch(t *testing.T, packed [][]byte, targetID string) (int, bool) {
+func findBatch(t *testing.T, packed []PackedBatch, targetID string) (int, bool) {
 	t.Helper()
 	for i, b := range packed {
-		for _, item := range decodeBatch(t, b) {
+		for _, item := range decodeBatch(t, b.Bytes) {
 			if fmt.Sprintf("%v", item["id"]) == targetID {
 				return i, true
 			}
@@ -98,7 +112,7 @@ func TestSingleThreshold_AllItemsFitOneBatch(t *testing.T) {
 	}
 	threshold := sizeTogether(items...) + 100
 
-	packed, errored := PackIntoSQSBatches(items, []uint64{threshold})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{threshold})
 
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d", len(errored))
@@ -122,7 +136,7 @@ func TestSingleThreshold_SplitAcrossMultipleBatches(t *testing.T) {
 	// We verify the correct invariants: no items lost, no batch exceeds threshold.
 	threshold := sizeAlone(items[0])
 
-	packed, errored := PackIntoSQSBatches(items, []uint64{threshold})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{threshold})
 
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d", len(errored))
@@ -131,8 +145,8 @@ func TestSingleThreshold_SplitAcrossMultipleBatches(t *testing.T) {
 		t.Errorf("expected 5 total items, got %d", countPackedItems(t, packed))
 	}
 	for i, batch := range packed {
-		if uint64(len(batch)) > threshold {
-			t.Errorf("batch %d size %d exceeds threshold %d", i, len(batch), threshold)
+		if uint64(len(batch.Bytes)) > threshold {
+			t.Errorf("batch %d size %d exceeds threshold %d", i, len(batch.Bytes), threshold)
 		}
 	}
 }
@@ -145,15 +159,15 @@ func TestMultipleThresholds_AllFitLowestTier(t *testing.T) {
 	}
 	// Each item is tiny; low threshold fits them all individually.
 	lowThreshold := sizeAlone(items[0]) + 50
-	packed, errored := PackIntoSQSBatches(items, []uint64{lowThreshold, lowThreshold * 2, lowThreshold * 4})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{lowThreshold, lowThreshold * 2, lowThreshold * 4})
 
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d", len(errored))
 	}
 	// Every batch must fit within the low threshold.
 	for i, batch := range packed {
-		if uint64(len(batch)) > lowThreshold {
-			t.Errorf("batch %d size %d exceeds low threshold %d", i, len(batch), lowThreshold)
+		if uint64(len(batch.Bytes)) > lowThreshold {
+			t.Errorf("batch %d size %d exceeds low threshold %d", i, len(batch.Bytes), lowThreshold)
 		}
 	}
 }
@@ -173,7 +187,7 @@ func TestMultipleThresholds_LeaderEscalatesToSecondTier(t *testing.T) {
 	}
 
 	items := []map[string]any{large, small}
-	packed, errored := PackIntoSQSBatches(items, []uint64{lowThreshold, highThreshold})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{lowThreshold, highThreshold})
 
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d: %v", len(errored), errored[0].Err)
@@ -185,12 +199,12 @@ func TestMultipleThresholds_LeaderEscalatesToSecondTier(t *testing.T) {
 	}
 
 	// Batch with large must not exceed highThreshold.
-	if uint64(len(packed[largeBatchIdx])) > highThreshold {
-		t.Errorf("large batch size %d exceeds highThreshold %d", len(packed[largeBatchIdx]), highThreshold)
+	if uint64(len(packed[largeBatchIdx].Bytes)) > highThreshold {
+		t.Errorf("large batch size %d exceeds highThreshold %d", len(packed[largeBatchIdx].Bytes), highThreshold)
 	}
 	// Batch with large must exceed lowThreshold (large alone already does).
-	if uint64(len(packed[largeBatchIdx])) <= lowThreshold {
-		t.Errorf("expected large batch to exceed lowThreshold %d, got %d", lowThreshold, len(packed[largeBatchIdx]))
+	if uint64(len(packed[largeBatchIdx].Bytes)) <= lowThreshold {
+		t.Errorf("expected large batch to exceed lowThreshold %d, got %d", lowThreshold, len(packed[largeBatchIdx].Bytes))
 	}
 }
 
@@ -208,7 +222,7 @@ func TestMultipleThresholds_LeaderEscalatesToMaxTier(t *testing.T) {
 		newPaddedItem("s2", 10),
 		newPaddedItem("s3", 10),
 	}
-	packed, errored := PackIntoSQSBatches(items, []uint64{lowThreshold, midThreshold, maxThreshold})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{lowThreshold, midThreshold, maxThreshold})
 
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d", len(errored))
@@ -218,8 +232,8 @@ func TestMultipleThresholds_LeaderEscalatesToMaxTier(t *testing.T) {
 	if !found {
 		t.Fatal("item 'huge' not found")
 	}
-	if uint64(len(packed[hugeBatchIdx])) > maxThreshold {
-		t.Errorf("huge batch size %d exceeds max threshold %d", len(packed[hugeBatchIdx]), maxThreshold)
+	if uint64(len(packed[hugeBatchIdx].Bytes)) > maxThreshold {
+		t.Errorf("huge batch size %d exceeds max threshold %d", len(packed[hugeBatchIdx].Bytes), maxThreshold)
 	}
 }
 
@@ -243,7 +257,7 @@ func TestMultipleThresholds_MixedLeadersRespectCeilings(t *testing.T) {
 	t2 := lgSize + 100
 	t3 := xlSize + 300
 
-	packed, errored := PackIntoSQSBatches(items, []uint64{t1, t2, t3})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{t1, t2, t3})
 
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d", len(errored))
@@ -254,10 +268,10 @@ func TestMultipleThresholds_MixedLeadersRespectCeilings(t *testing.T) {
 
 	// Every batch must not exceed the ceiling determined by its leader.
 	for i, batch := range packed {
-		decoded := decodeBatch(t, batch)
+		decoded := decodeBatch(t, batch.Bytes)
 		leaderSize := sizeAlone(decoded[0])
 		ceiling := ceilingFor(leaderSize, []uint64{t1, t2, t3})
-		batchSize := uint64(len(batch))
+		batchSize := uint64(len(batch.Bytes))
 		if batchSize > ceiling {
 			t.Errorf("batch %d: size %d > ceiling %d (leader '%v', size %d)",
 				i, batchSize, ceiling, decoded[0]["id"], leaderSize)
@@ -281,7 +295,7 @@ func TestFilling_SmallItemsFillLeftoverSpace(t *testing.T) {
 	threshold := leaderWithOneFiller + 10
 
 	items := append([]map[string]any{leader}, fillers...)
-	packed, errored := PackIntoSQSBatches(items, []uint64{threshold})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{threshold})
 
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d", len(errored))
@@ -292,12 +306,12 @@ func TestFilling_SmallItemsFillLeftoverSpace(t *testing.T) {
 		t.Fatal("leader not found in any batch")
 	}
 
-	leaderBatch := decodeBatch(t, packed[leaderBatchIdx])
+	leaderBatch := decodeBatch(t, packed[leaderBatchIdx].Bytes)
 	if len(leaderBatch) < 2 {
 		t.Errorf("expected leader batch to contain at least 2 items (leader + 1 filler), got %d", len(leaderBatch))
 	}
-	if uint64(len(packed[leaderBatchIdx])) > threshold {
-		t.Errorf("leader batch size %d exceeds threshold %d", len(packed[leaderBatchIdx]), threshold)
+	if uint64(len(packed[leaderBatchIdx].Bytes)) > threshold {
+		t.Errorf("leader batch size %d exceeds threshold %d", len(packed[leaderBatchIdx].Bytes), threshold)
 	}
 }
 
@@ -313,14 +327,14 @@ func TestFilling_NoLeftoverFits(t *testing.T) {
 	threshold := sizeAlone(leader)
 
 	items := append([]map[string]any{leader}, others...)
-	packed, _ := PackIntoSQSBatches(items, []uint64{threshold})
+	packed, _ := PackIntoSQSBatches(toSQSItems(items),[]uint64{threshold})
 
 	leaderBatchIdx, found := findBatch(t, packed, "leader")
 	if !found {
 		t.Fatal("leader not found")
 	}
 
-	leaderBatch := decodeBatch(t, packed[leaderBatchIdx])
+	leaderBatch := decodeBatch(t, packed[leaderBatchIdx].Bytes)
 	if len(leaderBatch) != 1 {
 		t.Errorf("expected leader batch to have exactly 1 item (no room for fillers), got %d", len(leaderBatch))
 	}
@@ -340,13 +354,13 @@ func TestErrored_OneItemExceedsMax(t *testing.T) {
 	}
 
 	items := []map[string]any{huge, normal}
-	packed, errored := PackIntoSQSBatches(items, []uint64{maxThreshold})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{maxThreshold})
 
 	if len(errored) != 1 {
 		t.Fatalf("expected 1 errored item, got %d", len(errored))
 	}
-	if fmt.Sprintf("%v", errored[0].Content["id"]) != "over" {
-		t.Errorf("expected errored item 'over', got %v", errored[0].Content["id"])
+	if errored[0].MessageID != "over" {
+		t.Errorf("expected errored item 'over', got %v", errored[0].MessageID)
 	}
 	if countPackedItems(t, packed) != 1 {
 		t.Fatalf("expected 1 packed item, got %d", countPackedItems(t, packed))
@@ -371,7 +385,7 @@ func TestErrored_MultipleItemsExceedMax(t *testing.T) {
 		newPaddedItem("over3", 2000),
 	}
 
-	packed, errored := PackIntoSQSBatches(items, []uint64{maxThreshold})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{maxThreshold})
 
 	if len(errored) != 3 {
 		t.Fatalf("expected 3 errored items, got %d", len(errored))
@@ -382,7 +396,7 @@ func TestErrored_MultipleItemsExceedMax(t *testing.T) {
 
 	erroredIDs := map[string]bool{}
 	for _, e := range errored {
-		erroredIDs[fmt.Sprintf("%v", e.Content["id"])] = true
+		erroredIDs[e.MessageID] = true
 	}
 	for _, expected := range []string{"over1", "over2", "over3"} {
 		if !erroredIDs[expected] {
@@ -400,7 +414,7 @@ func TestErrored_AllItemsExceedMax(t *testing.T) {
 	// Threshold too small for any item.
 	threshold := uint64(5)
 
-	packed, errored := PackIntoSQSBatches(items, []uint64{threshold})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{threshold})
 
 	if len(errored) != 3 {
 		t.Fatalf("expected 3 errored items, got %d", len(errored))
@@ -424,7 +438,7 @@ func TestInvariant_NoItemsLost(t *testing.T) {
 		newPaddedItem("err2", 2000),
 	}
 
-	packed, errored := PackIntoSQSBatches(items, []uint64{maxThreshold})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{maxThreshold})
 
 	total := countPackedItems(t, packed) + len(errored)
 	if total != len(items) {
@@ -449,7 +463,7 @@ func TestInvariant_AllBatchesBelowThreshold(t *testing.T) {
 	}
 
 	thresholds := []uint64{maxSize, maxSize * 2, maxSize * 4}
-	packed, errored := PackIntoSQSBatches(items, thresholds)
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),thresholds)
 
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d", len(errored))
@@ -457,8 +471,8 @@ func TestInvariant_AllBatchesBelowThreshold(t *testing.T) {
 
 	maxThreshold := thresholds[len(thresholds)-1]
 	for i, batch := range packed {
-		if uint64(len(batch)) > maxThreshold {
-			t.Errorf("batch %d size %d exceeds max threshold %d", i, len(batch), maxThreshold)
+		if uint64(len(batch.Bytes)) > maxThreshold {
+			t.Errorf("batch %d size %d exceeds max threshold %d", i, len(batch.Bytes), maxThreshold)
 		}
 	}
 	if countPackedItems(t, packed) != len(items) {
@@ -480,14 +494,14 @@ func TestOrdering_LeaderIsLargestInBatch(t *testing.T) {
 	largeSize := sizeAlone(newPaddedItem("ref", 200))
 	threshold := largeSize + 300
 
-	packed, errored := PackIntoSQSBatches(items, []uint64{threshold})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{threshold})
 
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d", len(errored))
 	}
 
 	for i, batch := range packed {
-		decoded := decodeBatch(t, batch)
+		decoded := decodeBatch(t, batch.Bytes)
 		if len(decoded) == 0 {
 			t.Errorf("batch %d is empty", i)
 			continue
@@ -521,16 +535,16 @@ func TestOrdering_InputOrderDoesNotAffectResult(t *testing.T) {
 	lgSize := sizeAlone(newPaddedItem("lg", 200))
 	threshold := lgSize + 500
 
-	packedAsc, _ := PackIntoSQSBatches(ascending, []uint64{threshold})
-	packedDesc, _ := PackIntoSQSBatches(descending, []uint64{threshold})
+	packedAsc, _ := PackIntoSQSBatches(toSQSItems(ascending), []uint64{threshold})
+	packedDesc, _ := PackIntoSQSBatches(toSQSItems(descending), []uint64{threshold})
 
 	if len(packedAsc) != len(packedDesc) {
 		t.Fatalf("different batch counts: asc=%d desc=%d", len(packedAsc), len(packedDesc))
 	}
 	// Each corresponding batch must have the same number of items and the same leader id.
 	for i := range packedAsc {
-		decAsc := decodeBatch(t, packedAsc[i])
-		decDesc := decodeBatch(t, packedDesc[i])
+		decAsc := decodeBatch(t, packedAsc[i].Bytes)
+		decDesc := decodeBatch(t, packedDesc[i].Bytes)
 		if len(decAsc) != len(decDesc) {
 			t.Errorf("batch %d: asc items %d != desc items %d", i, len(decAsc), len(decDesc))
 			continue
@@ -558,8 +572,8 @@ func TestThresholdOrder_UnorderedProducesSameResult(t *testing.T) {
 	t2 := maxSize
 	t3 := maxSize * 3
 
-	pack := func(items []map[string]any, thresholds []uint64) [][]byte {
-		p, _ := PackIntoSQSBatches(items, thresholds)
+	pack := func(items []map[string]any, thresholds []uint64) []PackedBatch {
+		p, _ := PackIntoSQSBatches(toSQSItems(items),thresholds)
 		return p
 	}
 
@@ -574,9 +588,9 @@ func TestThresholdOrder_UnorderedProducesSameResult(t *testing.T) {
 	// A warm high-compression encoder may produce slightly different byte sizes
 	// for identical content depending on encoder state, but the grouping must be identical.
 	for i := range p1 {
-		n1 := len(decodeBatch(t, p1[i]))
-		n2 := len(decodeBatch(t, p2[i]))
-		n3 := len(decodeBatch(t, p3[i]))
+		n1 := len(decodeBatch(t, p1[i].Bytes))
+		n2 := len(decodeBatch(t, p2[i].Bytes))
+		n3 := len(decodeBatch(t, p3[i].Bytes))
 		if n1 != n2 || n2 != n3 {
 			t.Errorf("batch %d item counts differ: %d, %d, %d", i, n1, n2, n3)
 		}
@@ -593,7 +607,7 @@ func TestContentIntegrity_ItemsSurviveRoundTrip(t *testing.T) {
 	}
 	threshold := sizeTogether(items...) + 100
 
-	packed, errored := PackIntoSQSBatches(items, []uint64{threshold})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{threshold})
 
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d", len(errored))
@@ -601,7 +615,7 @@ func TestContentIntegrity_ItemsSurviveRoundTrip(t *testing.T) {
 
 	found := map[string]bool{"alice": false, "bob": false, "charlie": false}
 	for _, batch := range packed {
-		for _, item := range decodeBatch(t, batch) {
+		for _, item := range decodeBatch(t, batch.Bytes) {
 			id := fmt.Sprintf("%v", item["id"])
 			if _, exists := found[id]; exists {
 				found[id] = true
@@ -624,7 +638,7 @@ func TestContentIntegrity_NoDuplicates(t *testing.T) {
 	}
 
 	maxSize := sizeAlone(items[0])
-	packed, errored := PackIntoSQSBatches(items, []uint64{maxSize, maxSize * 2, maxSize * 4})
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),[]uint64{maxSize, maxSize * 2, maxSize * 4})
 
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d", len(errored))
@@ -632,7 +646,7 @@ func TestContentIntegrity_NoDuplicates(t *testing.T) {
 
 	seen := map[string]int{}
 	for i, batch := range packed {
-		for _, item := range decodeBatch(t, batch) {
+		for _, item := range decodeBatch(t, batch.Bytes) {
 			id := fmt.Sprintf("%v", item["id"])
 			if prev, ok := seen[id]; ok {
 				t.Errorf("item '%s' appears in batch %d and batch %d", id, prev, i)
@@ -661,7 +675,7 @@ func TestScale_ManyItemsAllPackedAndRespectThresholds(t *testing.T) {
 	}
 
 	thresholds := []uint64{maxSize, maxSize * 2, maxSize * 4}
-	packed, errored := PackIntoSQSBatches(items, thresholds)
+	packed, errored := PackIntoSQSBatches(toSQSItems(items),thresholds)
 
 	if len(errored) != 0 {
 		t.Fatalf("expected 0 errored, got %d", len(errored))
@@ -672,9 +686,9 @@ func TestScale_ManyItemsAllPackedAndRespectThresholds(t *testing.T) {
 
 	maxThreshold := thresholds[len(thresholds)-1]
 	for i, batch := range packed {
-		decoded := decodeBatch(t, batch)
-		if uint64(len(batch)) > maxThreshold {
-			t.Errorf("batch %d size %d > max threshold %d", i, len(batch), maxThreshold)
+		decoded := decodeBatch(t, batch.Bytes)
+		if uint64(len(batch.Bytes)) > maxThreshold {
+			t.Errorf("batch %d size %d > max threshold %d", i, len(batch.Bytes), maxThreshold)
 		}
 		// Leader must be the largest item in the batch by sizeAlone.
 		if len(decoded) > 1 {
@@ -690,7 +704,7 @@ func TestScale_ManyItemsAllPackedAndRespectThresholds(t *testing.T) {
 	// No item appears more than once.
 	seen := map[string]bool{}
 	for _, batch := range packed {
-		for _, item := range decodeBatch(t, batch) {
+		for _, item := range decodeBatch(t, batch.Bytes) {
 			id := fmt.Sprintf("%v", item["id"])
 			if seen[id] {
 				t.Errorf("duplicate item: %s", id)
